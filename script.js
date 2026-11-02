@@ -1,0 +1,1772 @@
+(function() {
+    try {
+        if (window.self !== window.top) {
+            window.top.location = window.self.location;
+        }
+    } catch(e) {}
+})();
+
+// Docente único oficial fijo asignado con datos reales
+const DOCENTE_OFICIAL = {
+    id: 1,
+    nombreCompleto: "Hugo Alberto Sánchez Vega",
+    nombre: "Hugo",
+    rut: "12.626.135-7",
+    correo: "academia@chileinnova2050.cl",
+    pass: "CasaAzul27$",
+    pinEnc: [49, 57, 56, 56], // PIN '1988'
+    fono: "+56 9 7528 0132",
+    rol: "docente"
+};
+
+const DOMINIOS_REALES_PERMITIDOS = ['gmail.com', 'outlook.com', 'hotmail.com', 'yahoo.com', 'icloud.com', 'chileinnova2050.cl', 'uc.cl', 'uchile.cl', 'usach.cl'];
+
+function esCorreoRealValido(email) {
+    if (!email || !email.includes('@')) return false;
+    const partes = email.toLowerCase().split('@');
+    if (partes.length !== 2) return false;
+    const domain = partes[1].trim();
+    return DOMINIOS_REALES_PERMITIDOS.includes(domain);
+}
+
+// PERSISTENCIA COMPARTIDA Y MULTI-DISPOSITIVO REAL (PeerJS P2P + Cloud Signaling Fallback + BroadcastChannel + Sync API + Storage Events + IndexedDB + LocalStorage)
+const DB_NAME = 'Aula_CI2050_DB';
+const DB_VERSION = 1;
+let idb = null;
+
+const broadcastChannel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('aula_ci2050_sync_channel') : null;
+
+// PeerJS for multi-device real-time sync across different IPs / networks / Android / iOS / Consolas / GitHub Pages
+let peer = null;
+let peerConnections = [];
+const ROOM_ID_PEER = 'aula-ci2050-shared-room-v3-universal';
+
+function initPeerSync() {
+    if (typeof Peer === 'undefined') return;
+    try {
+        // Configuración P2P compatible con dispositivos móviles, Android, iOS y consolas con soporte STUN/TURN universal
+        peer = new Peer(ROOM_ID_PEER, {
+            config: {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' },
+                    { urls: 'stun:stun2.l.google.com:19302' }
+                ]
+            }
+        });
+        
+        peer.on('open', (id) => {});
+
+        peer.on('connection', (conn) => {
+            peerConnections.push(conn);
+            setupConnEvents(conn);
+            conn.send({
+                type: 'FULL_STATE_SYNC',
+                data: {
+                    estudiantes: estudiantesDB,
+                    cursos: cursosDB,
+                    materiales: materialesDB,
+                    complementarios: complementariosDB,
+                    evaluaciones: evaluacionesDB,
+                    progress: studentProgressDB,
+                    submissions: studentSubmissionsDB
+                }
+            });
+        });
+
+        peer.on('error', (err) => {
+            if (err.type === 'unavailable-id') {
+                peer = new Peer({
+                    config: {
+                        iceServers: [
+                            { urls: 'stun:stun.l.google.com:19302' },
+                            { urls: 'stun:stun1.l.google.com:19302' }
+                        ]
+                    }
+                });
+                peer.on('open', () => {
+                    const conn = peer.connect(ROOM_ID_PEER);
+                    if (conn) {
+                        peerConnections.push(conn);
+                        setupConnEvents(conn);
+                    }
+                });
+            }
+        });
+    } catch(e) {}
+}
+
+function setupConnEvents(conn) {
+    conn.on('data', (data) => {
+        if (data && data.type === 'FULL_STATE_SYNC') {
+            const d = data.data;
+            if (d.estudiantes !== undefined) estudiantesDB = d.estudiantes;
+            if (d.cursos !== undefined) cursosDB = d.cursos;
+            if (d.materiales !== undefined) materialesDB = d.materiales;
+            if (d.complementarios !== undefined) complementariosDB = d.complementarios;
+            if (d.evaluaciones !== undefined) evaluacionesDB = d.evaluaciones;
+            if (d.progress !== undefined) studentProgressDB = d.progress;
+            if (d.submissions !== undefined) studentSubmissionsDB = d.submissions;
+
+            saveLocalOnly();
+            if (currentUser) updateHeaderProfile();
+            renderDocenteListView();
+            refreshActiveModalUI();
+        } else if (data && data.type === 'DATA_UPDATED') {
+            const { key, value } = data;
+            if (key === 'ci2050_estudiantes') estudiantesDB = value;
+            if (key === 'ci2050_cursos') cursosDB = value;
+            if (key === 'ci2050_materiales') materialesDB = value;
+            if (key === 'ci2050_complementarios') complementariosDB = value;
+            if (key === 'ci2050_evaluaciones') evaluacionesDB = value;
+            if (key === 'ci2050_progress') studentProgressDB = value;
+            if (key === 'ci2050_submissions') studentSubmissionsDB = value;
+
+            saveLocalOnly();
+            if (currentUser) updateHeaderProfile();
+            renderDocenteListView();
+            refreshActiveModalUI();
+        }
+    });
+
+    conn.on('close', () => {
+        peerConnections = peerConnections.filter(c => c !== conn);
+    });
+}
+
+function refreshActiveModalUI() {
+    if (document.getElementById('modal-overlay') && !document.getElementById('modal-overlay').classList.contains('hidden')) {
+        const titleText = document.getElementById('modal-title').innerText;
+        if (titleText.includes('CURSOS')) openModal('courses');
+        else if (titleText.includes('MATERIAL') || titleText.includes('VIDEOS')) openModal('resources');
+        else if (titleText.includes('EVALUACIÓN') || titleText.includes('EVALUACIONES')) openModal('tests');
+    }
+}
+
+function broadcastPeerMessage(payload) {
+    peerConnections.forEach(conn => {
+        if (conn && conn.open) {
+            try { conn.send(payload); } catch(e) {}
+        }
+    });
+}
+
+function initIndexedDB() {
+    return new Promise((resolve) => {
+        try {
+            const request = indexedDB.open(DB_NAME, DB_VERSION);
+            request.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains('app_data')) {
+                    db.createObjectStore('app_data', { keyPath: 'key' });
+                }
+            };
+            request.onsuccess = (e) => {
+                idb = e.target.result;
+                resolve(idb);
+            };
+            request.onerror = () => resolve(null);
+        } catch(err) {
+            resolve(null);
+        }
+    });
+}
+
+function saveLocalOnly() {
+    try {
+        localStorage.setItem('ci2050_estudiantes', JSON.stringify(estudiantesDB));
+        localStorage.setItem('ci2050_cursos', JSON.stringify(cursosDB));
+        localStorage.setItem('ci2050_materiales', JSON.stringify(materialesDB));
+        localStorage.setItem('ci2050_complementarios', JSON.stringify(complementariosDB));
+        localStorage.setItem('ci2050_evaluaciones', JSON.stringify(evaluacionesDB));
+        localStorage.setItem('ci2050_progress', JSON.stringify(studentProgressDB));
+        localStorage.setItem('ci2050_submissions', JSON.stringify(studentSubmissionsDB));
+    } catch(e) {}
+}
+
+async function saveToDB(key, data) {
+    try {
+        localStorage.setItem(key, JSON.stringify(data));
+    } catch(e) {}
+
+    if (idb) {
+        try {
+            const tx = idb.transaction('app_data', 'readwrite');
+            tx.objectStore('app_data').put({ key: key, value: data });
+        } catch(e) {}
+    }
+
+    if (broadcastChannel) {
+        try {
+            broadcastChannel.postMessage({ type: 'DATA_UPDATED', key: key, value: data });
+        } catch(e) {}
+    }
+
+    broadcastPeerMessage({ type: 'DATA_UPDATED', key: key, value: data });
+}
+
+async function loadFromDB(key, defaultVal) {
+    let val = null;
+    try {
+        const lsVal = localStorage.getItem(key);
+        if (lsVal !== null) val = JSON.parse(lsVal);
+    } catch(e) {}
+
+    if (!val && idb) {
+        try {
+            val = await new Promise((resolve) => {
+                const tx = idb.transaction('app_data', 'readonly');
+                const req = tx.objectStore('app_data').get(key);
+                req.onsuccess = () => resolve(req.result ? req.result.value : null);
+                req.onerror = () => resolve(null);
+            });
+        } catch(e) {}
+    }
+    return val !== null ? val : defaultVal;
+}
+
+let docentesDB = [DOCENTE_OFICIAL];
+let estudiantesDB = [];
+let cursosDB = [];
+let materialesDB = [];
+let complementariosDB = [];
+let evaluacionesDB = [];
+let studentProgressDB = {};
+let studentSubmissionsDB = [];
+
+async function initStorage() {
+    await initIndexedDB();
+    estudiantesDB = await loadFromDB('ci2050_estudiantes', []);
+    cursosDB = await loadFromDB('ci2050_cursos', []);
+    materialesDB = await loadFromDB('ci2050_materiales', []);
+    complementariosDB = await loadFromDB('ci2050_complementarios', []);
+    evaluacionesDB = await loadFromDB('ci2050_evaluaciones', []);
+    studentProgressDB = await loadFromDB('ci2050_progress', {});
+    studentSubmissionsDB = await loadFromDB('ci2050_submissions', []);
+
+    // Restablecer sesión activa previa si existe (autoguardado implícito)
+    const lastSessionRole = localStorage.getItem('ci2050_last_role');
+    const lastSessionUser = localStorage.getItem('ci2050_last_user');
+
+    if (lastSessionRole && lastSessionUser) {
+        try {
+            currentRole = lastSessionRole;
+            currentUser = JSON.parse(lastSessionUser);
+            
+            if (currentRole === 'estudiante') {
+                const updatedSt = estudiantesDB.find(st => st.correo.toLowerCase() === currentUser.correo.toLowerCase());
+                if (updatedSt) currentUser = updatedSt;
+            } else if (currentRole === 'docente') {
+                currentUser = DOCENTE_OFICIAL;
+            }
+
+            document.getElementById('role-selection-screen').classList.add('hidden');
+            document.getElementById('auth-screen').classList.add('hidden');
+            document.getElementById('main-app').classList.remove('hidden');
+            setupRoleUI();
+        } catch(e) {}
+    }
+
+    persistData();
+    initPeerSync();
+}
+
+// Sincronización multi-dispositivo en tiempo real
+if (broadcastChannel) {
+    broadcastChannel.onmessage = async (event) => {
+        if (event.data && event.data.type === 'DATA_UPDATED') {
+            const { key, value } = event.data;
+            if (key === 'ci2050_estudiantes') estudiantesDB = value;
+            if (key === 'ci2050_cursos') cursosDB = value;
+            if (key === 'ci2050_materiales') materialesDB = value;
+            if (key === 'ci2050_complementarios') complementariosDB = value;
+            if (key === 'ci2050_evaluaciones') evaluacionesDB = value;
+            if (key === 'ci2050_progress') studentProgressDB = value;
+            if (key === 'ci2050_submissions') studentSubmissionsDB = value;
+
+            if (currentUser) updateHeaderProfile();
+            renderDocenteListView();
+            refreshActiveModalUI();
+        }
+    };
+}
+
+window.addEventListener('storage', async (e) => {
+    if (e.key === 'ci2050_estudiantes' && e.newValue) estudiantesDB = JSON.parse(e.newValue);
+    if (e.key === 'ci2050_cursos' && e.newValue) cursosDB = JSON.parse(e.newValue);
+    if (e.key === 'ci2050_materiales' && e.newValue) materialesDB = JSON.parse(e.newValue);
+    if (e.key === 'ci2050_complementarios' && e.newValue) complementariosDB = JSON.parse(e.newValue);
+    if (e.key === 'ci2050_evaluaciones' && e.newValue) evaluacionesDB = JSON.parse(e.newValue);
+    if (e.key === 'ci2050_progress' && e.newValue) studentProgressDB = JSON.parse(e.newValue);
+    if (e.key === 'ci2050_submissions' && e.newValue) studentSubmissionsDB = JSON.parse(e.newValue);
+
+    if (currentUser) updateHeaderProfile();
+    renderDocenteListView();
+    refreshActiveModalUI();
+});
+
+let currentRole = null;
+let currentUser = null;
+
+let editingStudentId = null;
+let editingCourseId = null;
+
+let pendingVideoFiles = [];
+let pendingCompFiles = [];
+
+function persistData() {
+    saveToDB('ci2050_estudiantes', estudiantesDB);
+    saveToDB('ci2050_cursos', cursosDB);
+    saveToDB('ci2050_materiales', materialesDB);
+    saveToDB('ci2050_complementarios', complementariosDB);
+    saveToDB('ci2050_evaluaciones', evaluacionesDB);
+    saveToDB('ci2050_progress', studentProgressDB);
+    saveToDB('ci2050_submissions', studentSubmissionsDB);
+}
+
+function togglePasswordVisibility(inputId, iconId) {
+    const input = document.getElementById(inputId);
+    const icon = document.getElementById(iconId);
+    if (!input || !icon) return;
+
+    if (input.type === "password") {
+        input.type = "text";
+        icon.className = "fa-solid fa-eye-slash text-chile-blue";
+    } else {
+        input.type = "password";
+        icon.className = "fa-solid fa-eye";
+    }
+}
+
+function selectRole(role) {
+    currentRole = role;
+    document.getElementById('role-selection-screen').classList.add('hidden');
+    document.getElementById('auth-screen').classList.remove('hidden');
+
+    const title = document.getElementById('auth-title');
+    const subtitle = document.getElementById('auth-subtitle');
+    const labelIdent = document.getElementById('label-identifier');
+    const inputIdent = document.getElementById('login-identifier');
+    const inputPass = document.getElementById('login-password');
+    const inputPin = document.getElementById('login-pin');
+    const btnSubmit = document.getElementById('login-submit-btn');
+    const docPinField = document.getElementById('docente-pin-field');
+
+    inputIdent.value = "";
+    inputPass.value = "";
+    inputPin.value = "";
+
+    if (role === 'docente') {
+        title.innerText = "Acceso Docente";
+        subtitle.innerText = "Ingrese su PIN de seguridad, correo y contraseña autorizados.";
+        labelIdent.innerText = "Correo Electrónico Docente";
+        inputIdent.placeholder = "Ingrese su correo";
+        btnSubmit.className = "w-full bg-chile-purple hover:bg-chile-purple-dark text-white font-extrabold py-3 rounded-lg shadow-md transition text-xs sm:text-sm tracking-wider uppercase flex items-center justify-center space-x-2 active:scale-98";
+        docPinField.classList.remove('hidden');
+        inputPin.required = true;
+    } else {
+        title.innerText = "Acceso Estudiante";
+        subtitle.innerText = "Ingrese su correo y contraseña asignados por su docente.";
+        labelIdent.innerText = "Correo Electrónico Estudiante";
+        inputIdent.placeholder = "Ingrese su correo";
+        btnSubmit.className = "w-full bg-chile-blue hover:bg-chile-blue-dark text-white font-extrabold py-3 rounded-lg shadow-md transition text-xs sm:text-sm tracking-wider uppercase flex items-center justify-center space-x-2 active:scale-98";
+        docPinField.classList.add('hidden');
+        inputPin.required = false;
+    }
+}
+
+function backToRoleSelection() {
+    document.getElementById('auth-screen').classList.add('hidden');
+    document.getElementById('role-selection-screen').classList.remove('hidden');
+    currentRole = null;
+}
+
+function handleLogin(e) {
+    e.preventDefault();
+    const identifier = document.getElementById('login-identifier').value.trim().toLowerCase();
+    const pass = document.getElementById('login-password').value;
+
+    if (currentRole === 'docente') {
+        const pinInput = document.getElementById('login-pin').value.trim();
+        const realPin = DOCENTE_OFICIAL.pinEnc.map(c => String.fromCharCode(c)).join('');
+
+        if (pinInput !== realPin || identifier !== DOCENTE_OFICIAL.correo.toLowerCase() || pass !== DOCENTE_OFICIAL.pass) {
+            showToast("Credenciales o PIN de docente incorrectos. Verifique sus datos.");
+            return;
+        }
+
+        currentUser = DOCENTE_OFICIAL;
+        startSession();
+
+    } else if (currentRole === 'estudiante') {
+        const foundStudent = estudiantesDB.find(st => st.correo.toLowerCase() === identifier && st.pass === pass);
+        if (foundStudent) {
+            currentUser = foundStudent;
+            startSession();
+        } else {
+            showToast("Credenciales de estudiante no encontradas o incorrectas.");
+        }
+    }
+}
+
+function startSession() {
+    document.getElementById('auth-screen').classList.add('hidden');
+    document.getElementById('main-app').classList.remove('hidden');
+    
+    try {
+        localStorage.setItem('ci2050_last_role', currentRole);
+        localStorage.setItem('ci2050_last_user', JSON.stringify(currentUser));
+    } catch(e) {}
+
+    setupRoleUI();
+    showToast(`¡Hola! ${currentUser.nombre}`);
+    verificarAvisoCursosCompletos();
+}
+
+function setupRoleUI() {
+    const isDocente = (currentRole === 'docente');
+    updateHeaderProfile();
+
+    document.getElementById('panel-role-text').innerText = isDocente 
+        ? '/ Panel Principal - Docente' 
+        : '/ Panel Principal - Estudiante';
+
+    const docenteView = document.getElementById('docente-list-view');
+    const estudianteView = document.getElementById('estudiante-panel-view');
+
+    if (isDocente) {
+        docenteView.classList.remove('hidden');
+        estudianteView.classList.add('hidden');
+        renderDocenteListView();
+    } else {
+        docenteView.classList.add('hidden');
+        estudianteView.classList.remove('hidden');
+
+        // Configurar etiquetas de panel de estudiante: Si tiene 1 solo curso o varios
+        const numCursos = (currentUser && currentUser.cursosAsignados) ? currentUser.cursosAsignados.length : 0;
+        const label1 = document.getElementById('btn-label-1');
+        const label2 = document.getElementById('btn-label-2');
+        const label3 = document.getElementById('btn-label-3');
+
+        if (numCursos <= 1) {
+            label1.innerText = "MI CURSO";
+            label2.innerText = "RECURSOS";
+            label3.innerText = "EVALUACIÓN";
+        } else {
+            label1.innerText = "MIS CURSOS";
+            label2.innerText = "RECURSOS";
+            label3.innerText = "EVALUACIONES";
+        }
+    }
+}
+
+function updateHeaderProfile() {
+    if (!currentUser) return;
+    const isDocente = (currentRole === 'docente');
+
+    document.getElementById('greeting-title').innerText = `¡Hola! ${currentUser.nombre}`;
+    document.getElementById('display-nombre').innerText = currentUser.nombreCompleto || currentUser.nombre;
+    document.getElementById('display-rol').innerText = isDocente ? 'Docente' : 'Estudiante';
+    document.getElementById('display-rut').innerText = currentUser.rut || "Sin RUT";
+    document.getElementById('display-correo').innerText = currentUser.correo;
+    document.getElementById('display-fono').innerText = currentUser.fono || "Sin Fono";
+
+    const courseStatusBox = document.getElementById('student-course-status-header');
+    const courseStatusText = document.getElementById('display-curso-asignado');
+
+    if (!isDocente && currentUser.cursosAsignados && currentUser.cursosAsignados.length > 0) {
+        const nombresCursos = currentUser.cursosAsignados.map(cId => {
+            const cObj = cursosDB.find(c => c.id === cId);
+            return cObj ? cObj.nombre : null;
+        }).filter(Boolean);
+
+        if (nombresCursos.length > 0) {
+            courseStatusText.innerText = `Está cursando: ${nombresCursos.join(', ')}`;
+            courseStatusBox.classList.remove('hidden');
+        } else {
+            courseStatusBox.classList.add('hidden');
+        }
+    } else {
+        courseStatusBox.classList.add('hidden');
+    }
+}
+
+function seleccionarTodosCursosDocente(marcar) {
+    const checkboxes = document.querySelectorAll('.st-course-chk');
+    checkboxes.forEach(chk => chk.checked = marcar);
+}
+
+function renderDocenteListView() {
+    if (currentRole !== 'docente') return;
+
+    // Actualizar select de cursos en formulario de credencial estudiante y gestor
+    const containerCheckboxes = document.getElementById('st-cursos-checkboxes-container');
+    const selVidCurso = document.getElementById('upload-vid-curso-id');
+    const selCompCurso = document.getElementById('comp-curso-id');
+
+    if (containerCheckboxes) {
+        if (cursosDB.length === 0) {
+            containerCheckboxes.innerHTML = '<p class="text-xs text-gray-500 italic p-1">No hay cursos creados aún. Crea un curso en el Gestor de Cursos superior.</p>';
+        } else {
+            containerCheckboxes.innerHTML = cursosDB.map(c => `
+                <label class="flex items-center space-x-2.5 p-2 rounded-md hover:bg-blue-50 cursor-pointer border border-slate-100 transition">
+                    <input type="checkbox" value="${c.id}" class="st-course-chk w-4 h-4 text-chile-blue rounded border-gray-300 focus:ring-blue-500">
+                    <div class="truncate">
+                        <span class="font-bold text-gray-800 text-xs block">${c.nombre}</span>
+                        <span class="text-[11px] text-gray-500 truncate block">${c.descripcion}</span>
+                    </div>
+                </label>
+            `).join('');
+        }
+    }
+
+    const optionsHTML = cursosDB.length === 0 
+        ? '<option value="">No hay cursos creados aún</option>' 
+        : cursosDB.map(c => `<option value="${c.id}">${c.nombre}</option>`).join('');
+
+    if (selVidCurso) selVidCurso.innerHTML = optionsHTML;
+    if (selCompCurso) selCompCurso.innerHTML = optionsHTML;
+
+    // Cursos list
+    const containerCursos = document.getElementById('docente-cursos-list-container');
+    if (containerCursos) {
+        containerCursos.innerHTML = cursosDB.length === 0 ? '<p class="text-xs text-gray-500 italic">No hay cursos creados.</p>' : `
+            <div class="space-y-2">
+                ${cursosDB.map(c => `
+                    <div class="flex items-center justify-between p-3 bg-white border rounded-lg shadow-sm">
+                        <div>
+                            <h5 class="font-bold text-gray-900 text-xs sm:text-sm">${c.nombre}</h5>
+                            <p class="text-[11px] text-gray-500">${c.descripcion}</p>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <button onclick="editarCurso(${c.id})" class="p-2 text-blue-600 hover:bg-blue-50 rounded-lg text-xs font-bold border"><i class="fa-solid fa-pen-to-square"></i></button>
+                            <button onclick="eliminarCurso(${c.id})" class="p-2 text-red-600 hover:bg-red-50 rounded-lg text-xs font-bold border"><i class="fa-solid fa-trash"></i></button>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+    }
+
+    // Estudiantes list
+    const containerEst = document.getElementById('docente-estudiantes-list-container');
+    if (containerEst) {
+        containerEst.innerHTML = estudiantesDB.length === 0 ? '<p class="text-xs text-gray-500 italic">No hay estudiantes registrados actualmente.</p>' : `
+            <div class="space-y-2">
+                ${estudiantesDB.map(s => {
+                    let cursosNombres = "Sin cursos asignados";
+                    if (s.cursosAsignados && s.cursosAsignados.length > 0) {
+                        const cList = s.cursosAsignados.map(cId => {
+                            const cObj = cursosDB.find(c => c.id === cId);
+                            return cObj ? cObj.nombre : null;
+                        }).filter(Boolean);
+                        if (cList.length > 0) cursosNombres = cList.join(', ');
+                    }
+                    return `
+                        <div class="flex items-center justify-between p-3 bg-white border rounded-lg shadow-sm">
+                            <div>
+                                <h5 class="font-bold text-gray-900 text-xs sm:text-sm">${s.nombreCompleto}</h5>
+                                <p class="text-[11px] text-gray-500">${s.correo} | Clave: ${s.pass} | RUT: ${s.rut}</p>
+                                <p class="text-[11px] font-bold text-chile-purple mt-0.5"><i class="fa-solid fa-book-bookmark mr-1"></i>Está cursando: ${cursosNombres}</p>
+                            </div>
+                            <div class="flex items-center space-x-2">
+                                <button onclick="editarEstudiante(${s.id})" class="p-2 text-purple-600 rounded text-xs border"><i class="fa-solid fa-pen-to-square"></i></button>
+                                <button onclick="eliminarEstudiante(${s.id})" class="p-2 text-red-600 rounded text-xs border" title="Eliminar estudiante"><i class="fa-solid fa-trash"></i></button>
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    // Videos list
+    const containerVid = document.getElementById('docente-videos-list-container');
+    if (containerVid) {
+        containerVid.innerHTML = materialesDB.length === 0 ? '<p class="text-xs text-gray-500 italic">No hay videos cargados.</p>' : `
+            <div class="space-y-2">
+                ${materialesDB.map(m => {
+                    const curso = cursosDB.find(c => c.id === m.cursoId);
+                    return `
+                        <div class="flex items-center justify-between p-2.5 bg-white border rounded-lg shadow-sm">
+                            <div class="truncate pr-2">
+                                <h5 class="font-bold text-gray-900 text-xs truncate">${m.titulo}</h5>
+                                <p class="text-[11px] text-gray-500">Curso: ${curso ? curso.nombre : 'General'} | Peso Real: ${m.tamano}</p>
+                            </div>
+                            <div class="flex items-center space-x-1">
+                                <button onclick="reproducirVideoModal('${m.titulo.replace(/'/g, "")}', '${m.url}', '${m.tamano}', ${m.id})" class="px-2.5 py-1 bg-purple-600 text-white rounded font-bold text-[11px]">Ver</button>
+                                <button onclick="eliminarMaterial(${m.id})" class="p-1 text-red-600 border rounded" title="Eliminar"><i class="fa-solid fa-trash"></i></button>
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    // Complementarios list
+    const containerComp = document.getElementById('docente-complementarios-list-container');
+    if (containerComp) {
+        containerComp.innerHTML = complementariosDB.length === 0 ? '<p class="text-xs text-gray-500 italic">No hay material complementario cargado.</p>' : `
+            <div class="space-y-2">
+                ${complementariosDB.map(comp => {
+                    const curso = cursosDB.find(c => c.id === comp.cursoId);
+                    const isUrl = (comp.tipo === 'URL');
+                    return `
+                        <div class="flex items-center justify-between p-2.5 bg-white border rounded-lg shadow-sm">
+                            <div class="truncate pr-2">
+                                <h5 class="font-bold text-gray-900 text-xs truncate">${comp.titulo}</h5>
+                                <p class="text-[11px] text-gray-500">Curso: ${curso ? curso.nombre : 'General'} | ${comp.tamano}</p>
+                            </div>
+                            <div class="flex items-center space-x-1">
+                                <button onclick="abrirComplementario(${comp.id})" class="px-2.5 py-1 bg-blue-600 text-white rounded font-bold text-[11px]">${isUrl ? 'URL' : 'Ver/Descargar'}</button>
+                                <button onclick="eliminarComplementario(${comp.id})" class="p-1 text-red-600 border rounded" title="Eliminar"><i class="fa-solid fa-trash"></i></button>
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    // Evaluaciones list
+    const containerEval = document.getElementById('docente-evaluaciones-list-container');
+    if (containerEval) {
+        containerEval.innerHTML = evaluacionesDB.length === 0 ? '<p class="text-xs text-gray-500 italic">No hay evaluaciones creadas.</p>' : `
+            <div class="space-y-2">
+                ${evaluacionesDB.map(ev => {
+                    const curso = cursosDB.find(c => c.id === ev.cursoId);
+                    const estaHabilitada = ev.habilitadaDocente;
+
+                    return `
+                        <div class="p-3 bg-white border rounded-xl shadow-sm space-y-2">
+                            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                                <div>
+                                    <h5 class="font-black text-gray-900 text-xs sm:text-sm">${ev.titulo}</h5>
+                                    <p class="text-[11px] text-gray-500 font-semibold">Curso: ${curso ? curso.nombre : 'General'} | 21 Preguntas Configuradas</p>
+                                </div>
+                                <div class="flex items-center space-x-2">
+                                    <span class="px-2 py-0.5 rounded text-[10px] font-extrabold ${estaHabilitada ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}">
+                                        ${estaHabilitada ? 'HABILITADA' : 'INHABILITADA'}
+                                    </span>
+                                    <button onclick="toggleHabilitacionEvaluacionDocente(${ev.id})" class="px-2.5 py-1 text-[11px] font-bold uppercase rounded text-white ${estaHabilitada ? 'bg-amber-600 hover:bg-amber-700' : 'bg-green-600 hover:bg-green-700'} shadow transition">
+                                        ${estaHabilitada ? 'Inhabilitar' : 'Habilitar'}
+                                    </button>
+                                    <button onclick="abrirFormularioCrearEvaluacion(${ev.id})" class="p-1.5 text-blue-600 border rounded" title="Editar"><i class="fa-solid fa-pen-to-square"></i></button>
+                                    <button onclick="eliminarEvaluacion(${ev.id})" class="p-1.5 text-red-600 border rounded" title="Eliminar"><i class="fa-solid fa-trash"></i></button>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+}
+
+function formatBytes(bytes) {
+    if (bytes === 0 || isNaN(bytes)) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+// --- GESTIÓN DE CURSOS ---
+function guardarCursoDocente(e) {
+    e.preventDefault();
+    const nombre = document.getElementById('new-course-name').value.trim();
+    const desc = document.getElementById('new-course-desc').value.trim();
+
+    if (!nombre) return;
+
+    if (editingCourseId) {
+        const curso = cursosDB.find(c => c.id === editingCourseId);
+        if (curso) {
+            curso.nombre = nombre;
+            curso.descripcion = desc || "Sin descripción.";
+            showToast("Curso actualizado correctamente.");
+        }
+        editingCourseId = null;
+    } else {
+        cursosDB.push({
+            id: Date.now(),
+            nombre: nombre,
+            descripcion: desc || "Sin descripción."
+        });
+        showToast(`Curso "${nombre}" creado con éxito.`);
+    }
+
+    persistData();
+    renderDocenteListView();
+    if (document.getElementById('modal-overlay') && !document.getElementById('modal-overlay').classList.contains('hidden')) {
+        openModal('courses');
+    }
+}
+
+function editarCurso(id) {
+    const curso = cursosDB.find(c => c.id === id);
+    if (!curso) return;
+
+    editingCourseId = id;
+    document.getElementById('new-course-name').value = curso.nombre;
+    document.getElementById('new-course-desc').value = curso.descripcion;
+    document.getElementById('btn-submit-course').innerText = "Guardar Cambios del Curso";
+    document.getElementById('btn-cancel-course-edit').classList.remove('hidden');
+}
+
+function cancelarEdicionCurso() {
+    editingCourseId = null;
+    document.getElementById('new-course-name').value = "";
+    document.getElementById('new-course-desc').value = "";
+    document.getElementById('btn-submit-course').innerText = "+ Crear Curso";
+    document.getElementById('btn-cancel-course-edit').classList.add('hidden');
+}
+
+function eliminarCurso(id) {
+    if (confirm("¿Estás seguro de eliminar este curso? Se eliminarán también sus videos, material complementario y evaluaciones asociadas.")) {
+        cursosDB = cursosDB.filter(c => c.id !== id);
+        materialesDB = materialesDB.filter(m => m.cursoId !== id);
+        complementariosDB = complementariosDB.filter(comp => comp.cursoId !== id);
+        evaluacionesDB = evaluacionesDB.filter(ev => ev.cursoId !== id);
+        
+        // Remover curso de asignaciones de estudiantes
+        estudiantesDB.forEach(st => {
+            if (st.cursosAsignados) {
+                st.cursosAsignados = st.cursosAsignados.filter(cId => cId !== id);
+            }
+        });
+
+        persistData();
+        showToast("Curso eliminado.");
+        renderDocenteListView();
+        if (document.getElementById('modal-overlay') && !document.getElementById('modal-overlay').classList.contains('hidden')) {
+            openModal('courses');
+        }
+    }
+}
+
+// --- GESTIÓN DE ESTUDIANTES Y CREDENCIALES ---
+function guardarEstudianteDocente(e) {
+    e.preventDefault();
+    const nombreComp = document.getElementById('st-nombre-completo').value.trim();
+    const rut = document.getElementById('st-rut').value.trim();
+    const correo = document.getElementById('st-correo').value.trim().toLowerCase();
+    const fono = document.getElementById('st-fono').value.trim();
+    const pass = document.getElementById('st-pass').value;
+
+    const chkNodes = document.querySelectorAll('.st-course-chk:checked');
+    const selectedOptions = Array.from(chkNodes).map(chk => parseInt(chk.value));
+
+    if (selectedOptions.length === 0) {
+        showToast("Debes seleccionar al menos un curso para el estudiante.");
+        return;
+    }
+
+    if (!esCorreoRealValido(correo)) {
+        showToast("Por favor ingrese un correo verdaderamente válido (Google, Outlook, Hotmail, etc.)");
+        return;
+    }
+
+    const nombresCursosElegidos = selectedOptions.map(cId => {
+        const cObj = cursosDB.find(c => c.id === cId);
+        return cObj ? cObj.nombre : null;
+    }).filter(Boolean).join(', ');
+
+    if (editingStudentId) {
+        const st = estudiantesDB.find(s => s.id === editingStudentId);
+        if (st) {
+            st.nombreCompleto = nombreComp;
+            st.nombre = nombreComp.split(' ')[0] || nombreComp;
+            st.rut = rut;
+            st.correo = correo;
+            st.fono = fono;
+            st.pass = pass;
+            st.cursosAsignados = selectedOptions;
+            showToast(`Credenciales actualizadas. Está cursando: ${nombresCursosElegidos}`);
+        }
+        editingStudentId = null;
+    } else {
+        if (estudiantesDB.some(st => st.correo.toLowerCase() === correo)) {
+            showToast("Este correo de estudiante ya está registrado.");
+            return;
+        }
+
+        estudiantesDB.push({
+            id: Date.now(),
+            nombreCompleto: nombreComp,
+            nombre: nombreComp.split(' ')[0] || nombreComp,
+            rut: rut,
+            correo: correo,
+            fono: fono,
+            pass: pass,
+            cursosAsignados: selectedOptions
+        });
+
+        showToast(`Está cursando: ${nombresCursosElegidos}`);
+    }
+
+    persistData();
+    cancelarEdicionEstudiante();
+    renderDocenteListView();
+    if (document.getElementById('modal-overlay') && !document.getElementById('modal-overlay').classList.contains('hidden')) {
+        openModal('courses');
+    }
+}
+
+function editarEstudiante(id) {
+    const st = estudiantesDB.find(s => s.id === id);
+    if (!st) return;
+
+    editingStudentId = id;
+    document.getElementById('st-nombre-completo').value = st.nombreCompleto;
+    document.getElementById('st-rut').value = st.rut;
+    document.getElementById('st-correo').value = st.correo;
+    document.getElementById('st-fono').value = st.fono;
+    document.getElementById('st-pass').value = st.pass;
+
+    const chkNodes = document.querySelectorAll('.st-course-chk');
+    if (chkNodes && st.cursosAsignados) {
+        chkNodes.forEach(chk => {
+            chk.checked = st.cursosAsignados.includes(parseInt(chk.value));
+        });
+    }
+
+    document.getElementById('btn-submit-student').innerText = "Guardar Cambios del Estudiante";
+    document.getElementById('btn-cancel-student-edit').classList.remove('hidden');
+}
+
+function cancelarEdicionEstudiante() {
+    editingStudentId = null;
+    document.getElementById('st-nombre-completo').value = "";
+    document.getElementById('st-rut').value = "";
+    document.getElementById('st-correo').value = "";
+    document.getElementById('st-fono').value = "";
+    document.getElementById('st-pass').value = "";
+
+    const chkNodes = document.querySelectorAll('.st-course-chk');
+    if (chkNodes) {
+        chkNodes.forEach(chk => chk.checked = false);
+    }
+
+    document.getElementById('btn-submit-student').innerText = "Registrar Estudiante";
+    document.getElementById('btn-cancel-student-edit').classList.add('hidden');
+}
+
+function eliminarEstudiante(stId) {
+    const st = estudiantesDB.find(s => s.id === stId);
+    if (!st) return;
+
+    if (confirm(`¿Deseas eliminar las credenciales de ${st.nombreCompleto}?`)) {
+        const correoBorrar = st.correo.toLowerCase();
+        estudiantesDB = estudiantesDB.filter(s => s.id !== stId);
+        
+        delete studentProgressDB[correoBorrar];
+        studentSubmissionsDB = studentSubmissionsDB.filter(sub => sub.studentCorreo.toLowerCase() !== correoBorrar);
+
+        persistData();
+        showToast("Credencial de estudiante eliminada.");
+        renderDocenteListView();
+        if (document.getElementById('modal-overlay') && !document.getElementById('modal-overlay').classList.contains('hidden')) {
+            openModal('courses');
+        }
+    }
+}
+
+// --- SISTEMA DE CREACIÓN Y EDICIÓN DE EVALUACIÓN DE 21 PREGUNTAS ---
+function abrirFormularioCrearEvaluacion(evalIdToEdit = null) {
+    const modalBody = document.getElementById('modal-body');
+    document.getElementById('modal-title').innerText = evalIdToEdit ? "EDITAR EVALUACIÓN" : "NUEVA EVALUACIÓN (21 PREGUNTAS)";
+
+    let evalData = null;
+    if (evalIdToEdit) {
+        evalData = evaluacionesDB.find(e => e.id === evalIdToEdit);
+    }
+
+    let html = `
+        <form onsubmit="guardarEvaluacion21Preguntas(event, ${evalIdToEdit})" class="space-y-4 text-xs">
+            <div class="bg-purple-50 p-3.5 rounded-xl border border-purple-200 space-y-3">
+                <div>
+                    <label class="block font-bold text-gray-800 mb-1">Seleccionar Curso Asociado</label>
+                    <select id="eval-form-curso-id" required class="w-full p-2 border rounded bg-white">
+                        ${cursosDB.map(c => `<option value="${c.id}" ${evalData && evalData.cursoId === c.id ? 'selected' : ''}>${c.nombre}</option>`).join('')}
+                    </select>
+                </div>
+                <div>
+                    <label class="block font-bold text-gray-800 mb-1">Título de la Evaluación</label>
+                    <input type="text" id="eval-form-titulo" value="${evalData ? evalData.titulo : 'Evaluación Oficial del Curso'}" required class="w-full p-2 border rounded bg-white" placeholder="Ej: Evaluación Módulo 1">
+                </div>
+            </div>
+
+            <div class="bg-amber-50 p-3 rounded-lg border border-amber-200 text-amber-900 font-semibold">
+                <i class="fa-solid fa-lightbulb text-amber-600 mr-1"></i> Configura las 21 preguntas requeridas. Selecciona el tipo de pregunta (Alternativa A B C D o Verdadero/Falso) para cada una.
+            </div>
+
+            <div class="space-y-3 max-h-[50vh] overflow-y-auto pr-1">
+    `;
+
+    for (let i = 0; i < 21; i++) {
+        const qExist = (evalData && evalData.preguntas && evalData.preguntas[i]) ? evalData.preguntas[i] : null;
+        const tipoVal = qExist ? qExist.tipo : 'mc';
+        const pregTexto = qExist ? qExist.pregunta : `Pregunta de evaluación #${i + 1}`;
+        const opcList = qExist ? qExist.opciones : ["Opción A", "Opción B", "Opción C", "Opción D"];
+        const correctaIdx = qExist ? qExist.correcta : 0;
+
+        html += `
+            <div class="bg-white p-3.5 rounded-xl border space-y-2 shadow-sm">
+                <div class="flex items-center justify-between">
+                    <span class="font-black text-chile-purple">Pregunta #${i + 1}</span>
+                    <div class="flex items-center space-x-2">
+                        <label class="font-bold text-gray-700">Tipo:</label>
+                        <select id="q_type_${i}" onchange="cambiarTipoPreguntaForm(${i})" class="p-1 border rounded bg-slate-50 font-bold text-xs">
+                            <option value="mc" ${tipoVal === 'mc' ? 'selected' : ''}>Alternativa (A B C D)</option>
+                            <option value="tf" ${tipoVal === 'tf' ? 'selected' : ''}>Verdadero / Falso</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div>
+                    <input type="text" id="q_text_${i}" value="${pregTexto}" required class="w-full p-2 border rounded font-semibold text-gray-800" placeholder="Escribe el enunciado de la pregunta...">
+                </div>
+
+                <div id="q_options_container_${i}" class="space-y-1.5 pt-1">
+                    ${renderOpcionesPreguntaFormHTML(i, tipoVal, opcList, correctaIdx)}
+                </div>
+            </div>
+        `;
+    }
+
+    html += `
+            </div>
+
+            <div class="pt-2 flex space-x-2">
+                <button type="submit" class="flex-grow bg-chile-purple hover:bg-chile-purple-dark text-white font-extrabold py-3 rounded-lg uppercase shadow transition">
+                    ${evalIdToEdit ? 'Guardar Cambios de Evaluación' : 'Crear Evaluación de 21 Preguntas'}
+                </button>
+                <button type="button" onclick="closeModal()" class="bg-gray-500 hover:bg-gray-600 text-white font-bold px-4 rounded-lg uppercase shadow transition">
+                    Cancelar
+                </button>
+            </div>
+        </form>
+    `;
+
+    modalBody.innerHTML = html;
+    document.getElementById('modal-overlay').classList.remove('hidden');
+}
+
+function renderOpcionesPreguntaFormHTML(index, tipo, opciones, correcta) {
+    let html = ``;
+    if (tipo === 'mc') {
+        const labels = ['A', 'B', 'C', 'D'];
+        for (let k = 0; k < 4; k++) {
+            const opText = opciones && opciones[k] !== undefined ? opciones[k] : `Opción ${labels[k]}`;
+            html += `
+                <div class="flex items-center space-x-2">
+                    <input type="radio" name="correcta_${index}" value="${k}" ${correcta === k ? 'checked' : ''} class="w-4 h-4 text-chile-purple">
+                    <span class="font-bold text-gray-600">${labels[k]})</span>
+                    <input type="text" id="q_op_${index}_${k}" value="${opText}" required class="flex-grow p-1.5 border rounded bg-slate-50 text-xs">
+                </div>
+            `;
+        }
+    } else {
+        const opTextV = opciones && opciones[0] ? opciones[0] : "Verdadero";
+        const opTextF = opciones && opciones[1] ? opciones[1] : "Falso";
+        html += `
+            <div class="flex items-center space-x-2">
+                <input type="radio" name="correcta_${index}" value="0" ${correcta === 0 ? 'checked' : ''} class="w-4 h-4 text-chile-purple">
+                <span class="font-bold text-gray-700">Verdadero</span>
+                <input type="hidden" id="q_op_${index}_0" value="${opTextV}">
+            </div>
+            <div class="flex items-center space-x-2">
+                <input type="radio" name="correcta_${index}" value="1" ${correcta === 1 ? 'checked' : ''} class="w-4 h-4 text-chile-purple">
+                <span class="font-bold text-gray-700">Falso</span>
+                <input type="hidden" id="q_op_${index}_1" value="${opTextF}">
+            </div>
+        `;
+    }
+    return html;
+}
+
+function cambiarTipoPreguntaForm(index) {
+    const selectType = document.getElementById(`q_type_${index}`);
+    const container = document.getElementById(`q_options_container_${index}`);
+    if (!selectType || !container) return;
+
+    const tipo = selectType.value;
+    if (tipo === 'mc') {
+        container.innerHTML = renderOpcionesPreguntaFormHTML(index, 'mc', ["Opción A", "Opción B", "Opción C", "Opción D"], 0);
+    } else {
+        container.innerHTML = renderOpcionesPreguntaFormHTML(index, 'tf', ["Verdadero", "Falso"], 0);
+    }
+}
+
+function guardarEvaluacion21Preguntas(e, evalIdEdit) {
+    e.preventDefault();
+    const cursoId = parseInt(document.getElementById('eval-form-curso-id').value);
+    const titulo = document.getElementById('eval-form-titulo').value.trim();
+
+    let preguntasArr = [];
+
+    for (let i = 0; i < 21; i++) {
+        const tipo = document.getElementById(`q_type_${i}`).value;
+        const pregunta = document.getElementById(`q_text_${i}`).value.trim();
+
+        const radioChecked = document.querySelector(`input[name="correcta_${i}"]:checked`);
+        const correctaIdx = radioChecked ? parseInt(radioChecked.value) : 0;
+
+        let opciones = [];
+        if (tipo === 'mc') {
+            for (let k = 0; k < 4; k++) {
+                const opVal = document.getElementById(`q_op_${i}_${k}`).value.trim();
+                opciones.push(opVal || `Opción ${['A','B','C','D'][k]}`);
+            }
+        } else {
+            opciones = ["Verdadero", "Falso"];
+        }
+
+        preguntasArr.push({
+            tipo: tipo,
+            pregunta: pregunta,
+            opciones: opciones,
+            correcta: correctaIdx
+        });
+    }
+
+    if (evalIdEdit) {
+        const evObj = evaluacionesDB.find(ev => ev.id === evalIdEdit);
+        if (evObj) {
+            evObj.cursoId = cursoId;
+            evObj.titulo = titulo;
+            evObj.preguntas = preguntasArr;
+            showToast("Evaluación actualizada correctamente.");
+        }
+    } else {
+        evaluacionesDB.push({
+            id: Date.now(),
+            cursoId: cursoId,
+            habilitadaDocente: false,
+            titulo: titulo,
+            preguntas: preguntasArr
+        });
+        showToast("Nueva evaluación de 21 preguntas creada.");
+    }
+
+    persistData();
+    closeModal();
+    renderDocenteListView();
+}
+
+function toggleHabilitacionEvaluacionDocente(evalId) {
+    const ev = evaluacionesDB.find(e => e.id === evalId);
+    if (ev) {
+        ev.habilitadaDocente = !ev.habilitadaDocente;
+        persistData();
+        showToast(ev.habilitadaDocente ? "Evaluación habilitada para el estudiante." : "Evaluación inhabilitada para el estudiante.");
+        renderDocenteListView();
+        if (document.getElementById('modal-overlay') && !document.getElementById('modal-overlay').classList.contains('hidden')) {
+            openModal('tests');
+        }
+    }
+}
+
+function eliminarEvaluacion(evalId) {
+    if (confirm("¿Estás seguro de eliminar esta evaluación?")) {
+        evaluacionesDB = evaluacionesDB.filter(e => e.id !== evalId);
+        persistData();
+        showToast("Evaluación eliminada.");
+        renderDocenteListView();
+        if (document.getElementById('modal-overlay') && !document.getElementById('modal-overlay').classList.contains('hidden')) {
+            openModal('tests');
+        }
+    }
+}
+
+// --- MANEJO DE ARCHIVOS PENDIENTES ---
+function handleVideoSelection(input) {
+    if (input.files && input.files.length > 0) {
+        pendingVideoFiles = Array.from(input.files);
+        const txt = document.getElementById('video-status-text');
+        if (txt) txt.innerText = `${pendingVideoFiles.length} video(s) listo(s) en espera de subida`;
+    }
+}
+
+function handleComplementarioSelection(input) {
+    if (input.files && input.files.length > 0) {
+        pendingCompFiles = Array.from(input.files);
+        const txt = document.getElementById('comp-status-text');
+        if (txt) txt.innerText = `${pendingCompFiles.length} archivo(s) listo(s) en espera de subida`;
+    }
+}
+
+function procesarSubidaSimultanea(cursoId, filesVideo, filesComp, tituloComp, urlComp) {
+    let subidosVideos = 0;
+    let subidosComp = 0;
+
+    if (filesVideo && filesVideo.length > 0) {
+        for (let i = 0; i < filesVideo.length; i++) {
+            const file = filesVideo[i];
+            materialesDB.push({
+                id: Date.now() + Math.random(),
+                cursoId: cursoId,
+                titulo: file.name,
+                tipo: 'MP4_FILE',
+                tamano: formatBytes(file.size),
+                url: URL.createObjectURL(file)
+            });
+            subidosVideos++;
+        }
+    }
+
+    if (filesComp && filesComp.length > 0) {
+        for (let f = 0; f < filesComp.length; f++) {
+            const file = filesComp[f];
+            complementariosDB.push({
+                id: Date.now() + Math.random(),
+                cursoId: cursoId,
+                titulo: `${tituloComp} - ${file.name}`,
+                tipo: 'FILE',
+                tamano: formatBytes(file.size),
+                url: URL.createObjectURL(file)
+            });
+            subidosComp++;
+        }
+    }
+
+    if (urlComp) {
+        complementariosDB.push({
+            id: Date.now() + Math.random(),
+            cursoId: cursoId,
+            titulo: `${tituloComp} (Enlace URL)`,
+            tipo: 'URL',
+            tamano: 'Enlace Web',
+            url: urlComp
+        });
+        subidosComp++;
+    }
+
+    persistData();
+    return { subidosVideos, subidosComp };
+}
+
+// --- VIDEOS Y MATERIAL COMPLEMENTARIO DOCENTE ---
+function subirVideoDocente(e) {
+    e.preventDefault();
+    const cursoIdSelect = document.getElementById('upload-vid-curso-id');
+    if (!cursoIdSelect || !cursoIdSelect.value) {
+        showToast("Debes crear un curso primero.");
+        return;
+    }
+    const cursoId = parseInt(cursoIdSelect.value);
+    const fileInput = document.getElementById('upload-video-file');
+    const files = (fileInput && fileInput.files.length > 0) ? Array.from(fileInput.files) : pendingVideoFiles;
+
+    if (!files || files.length === 0) {
+        showToast("Seleccione al menos un video MP4.");
+        return;
+    }
+
+    const res = procesarSubidaSimultanea(cursoId, files, pendingCompFiles, "Material Complementario", null);
+
+    if (fileInput) fileInput.value = "";
+    pendingVideoFiles = [];
+    pendingCompFiles = [];
+    const txt = document.getElementById('video-status-text');
+    if (txt) txt.innerText = "";
+    showToast(`Cargado(s): ${res.subidosVideos} video(s) MP4 y ${res.subidosComp} material(es).`);
+    renderDocenteListView();
+}
+
+function eliminarMaterial(id) {
+    if (confirm("¿Eliminar este video? Afectará el porcentaje de los estudiantes.")) {
+        materialesDB = materialesDB.filter(m => m.id !== id);
+        persistData();
+        showToast("Video eliminado.");
+        renderDocenteListView();
+        if (document.getElementById('modal-overlay') && !document.getElementById('modal-overlay').classList.contains('hidden')) {
+            openModal('resources');
+        }
+    }
+}
+
+function reproducirVideoModal(titulo, url, tamano, materialId) {
+    if (currentRole === 'estudiante' && currentUser) {
+        const cursoMat = materialesDB.find(m => m.id === materialId);
+        if (cursoMat) {
+            const cursoId = cursoMat.cursoId;
+            if (!studentProgressDB[currentUser.correo]) {
+                studentProgressDB[currentUser.correo] = {};
+            }
+            if (!studentProgressDB[currentUser.correo][cursoId]) {
+                studentProgressDB[currentUser.correo][cursoId] = { watchedVideos: [] };
+            }
+            if (!studentProgressDB[currentUser.correo][cursoId].watchedVideos) {
+                studentProgressDB[currentUser.correo][cursoId].watchedVideos = [];
+            }
+            if (!studentProgressDB[currentUser.correo][cursoId].watchedVideos.includes(materialId)) {
+                studentProgressDB[currentUser.correo][cursoId].watchedVideos.push(materialId);
+                persistData();
+                showToast("¡Video completado! Progreso actualizado.");
+                verificarAvisoCursosCompletos();
+            }
+        }
+    }
+
+    const tempDiv = document.createElement('div');
+    tempDiv.className = "fixed inset-0 bg-black/80 z-[10000] flex items-center justify-center p-3";
+    tempDiv.id = "video-player-overlay";
+    tempDiv.innerHTML = `
+        <div class="bg-white rounded-xl overflow-hidden max-w-3xl w-full p-3 sm:p-4 relative" onclick="event.stopPropagation()">
+            <div class="flex justify-between items-center mb-3">
+                <div class="truncate pr-2">
+                    <h3 class="font-bold text-xs sm:text-sm text-gray-800 truncate"><i class="fa-solid fa-circle-play text-chile-purple mr-2"></i>${titulo}</h3>
+                    <span class="text-[11px] text-gray-500 font-semibold">Tamaño Real: ${tamano}</span>
+                </div>
+                <button onclick="document.getElementById('video-player-overlay').remove();" class="text-gray-500 hover:text-black font-bold text-xl">&times;</button>
+            </div>
+            <video controls class="w-full rounded bg-black max-h-[60vh]" autoplay src="${url}">
+                Tu navegador no soporta el reproductor de video.
+            </video>
+        </div>
+    `;
+    document.body.appendChild(tempDiv);
+}
+
+// --- MATERIAL COMPLEMENTARIO ---
+let complementarioSlotsCount = 1;
+
+function agregarCasillaComplementaria() {
+    complementarioSlotsCount++;
+    const container = document.getElementById('complementario-slots-container');
+    if (!container) return;
+
+    const div = document.createElement('div');
+    div.className = "bg-white p-3 rounded-lg border space-y-2 relative shadow-sm";
+    div.innerHTML = `
+        <div class="flex justify-between items-center">
+            <span class="text-[11px] font-bold text-chile-purple">Ítem Complementario #${complementarioSlotsCount}</span>
+            <button type="button" onclick="this.parentElement.parentElement.remove()" class="text-red-500 hover:text-red-700 text-xs font-bold"><i class="fa-solid fa-trash"></i> Eliminar</button>
+        </div>
+        <div>
+            <label class="block text-[11px] font-semibold text-gray-700">Subir Archivo(s) (PDF, DOCX, XLSX, ZIP, etc.)</label>
+            <input type="file" multiple class="comp-file-input w-full p-1 border rounded bg-slate-50 text-xs" onchange="handleComplementarioSelection(this)">
+        </div>
+        <div>
+            <label class="block text-[11px] font-semibold text-gray-700">O Enlace URL</label>
+            <input type="url" placeholder="https://ejemplo.com/recurso" class="comp-url-input w-full p-1.5 border rounded bg-slate-50 text-xs">
+        </div>
+    `;
+    container.appendChild(div);
+}
+
+function subirComplementarioDocente(e) {
+    e.preventDefault();
+    const cursoIdSelect = document.getElementById('comp-curso-id');
+    if (!cursoIdSelect || !cursoIdSelect.value) {
+        showToast("Debes crear un curso primero.");
+        return;
+    }
+    const cursoId = parseInt(cursoIdSelect.value);
+    const tituloGlobal = document.getElementById('comp-titulo').value.trim() || "Material Complementario";
+    
+    const fileInputs = document.querySelectorAll('.comp-file-input');
+    const urlInputs = document.querySelectorAll('.comp-url-input');
+
+    let filesCompAll = [];
+    fileInputs.forEach((fi) => {
+        if (fi.files && fi.files.length > 0) {
+            filesCompAll = filesCompAll.concat(Array.from(fi.files));
+        }
+    });
+    if (filesCompAll.length === 0 && pendingCompFiles.length > 0) {
+        filesCompAll = pendingCompFiles;
+    }
+
+    let firstUrl = null;
+    urlInputs.forEach((ui) => {
+        if (ui.value.trim()) firstUrl = ui.value.trim();
+    });
+
+    const res = procesarSubidaSimultanea(cursoId, pendingVideoFiles, filesCompAll, tituloGlobal, firstUrl);
+
+    document.getElementById('comp-titulo').value = "";
+    pendingVideoFiles = [];
+    pendingCompFiles = [];
+    const txt = document.getElementById('comp-status-text');
+    if (txt) txt.innerText = "";
+    complementarioSlotsCount = 1;
+    showToast(`Guardados: ${res.subidosComp} elemento(s) complementarios y ${res.subidosVideos} video(s).`);
+    renderDocenteListView();
+}
+
+function eliminarComplementario(id) {
+    if (confirm("¿Eliminar este material complementario?")) {
+        complementariosDB = complementariosDB.filter(c => c.id !== id);
+        persistData();
+        showToast("Material complementario eliminado.");
+        renderDocenteListView();
+        if (document.getElementById('modal-overlay') && !document.getElementById('modal-overlay').classList.contains('hidden')) {
+            openModal('resources');
+        }
+    }
+}
+
+function abrirComplementario(compId) {
+    const comp = complementariosDB.find(c => c.id === compId);
+    if (!comp) return;
+
+    if (comp.tipo === 'URL') {
+        window.open(comp.url, '_blank');
+    } else {
+        const a = document.createElement('a');
+        a.href = comp.url;
+        a.download = comp.titulo;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        showToast(`Descargando ${comp.titulo}`);
+    }
+}
+
+// --- CÁLCULO DE PROGRESO DE CURSOS ---
+function calcularPorcentajeEstudiante(cursoId, studentCorreo) {
+    const videosCurso = materialesDB.filter(m => m.cursoId === cursoId && m.tipo === 'MP4_FILE');
+    if (videosCurso.length === 0) return 100;
+
+    const stProg = studentProgressDB[studentCorreo] || {};
+    const progCurso = stProg[cursoId] || { watchedVideos: [] };
+    const watched = progCurso.watchedVideos || [];
+
+    let watchedCount = 0;
+    videosCurso.forEach(v => {
+        if (watched.includes(v.id)) watchedCount++;
+    });
+
+    const porcentaje = Math.round((watchedCount / videosCurso.length) * 100);
+    return Math.min(100, porcentaje);
+}
+
+function estudianteCompletoTodosLosCursos(studentCorreo) {
+    if (cursosDB.length === 0) return true;
+    
+    const stObj = estudiantesDB.find(s => s.correo.toLowerCase() === studentCorreo.toLowerCase());
+    let cursosAVerificar = cursosDB;
+    if (stObj && stObj.cursosAsignados && stObj.cursosAsignados.length > 0) {
+        cursosAVerificar = cursosDB.filter(c => stObj.cursosAsignados.includes(c.id));
+    }
+
+    for (let c of cursosAVerificar) {
+        if (calcularPorcentajeEstudiante(c.id, studentCorreo) < 100) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function verificarAvisoCursosCompletos() {
+    if (currentRole !== 'estudiante' || !currentUser) return;
+
+    const todosListos = estudianteCompletoTodosLosCursos(currentUser.correo);
+
+    if (todosListos) {
+        showToast("¡Felicidades! Has completado el 100% de los videos. Estás listo para rendir la evaluación.");
+    } else {
+        let incompletos = 0;
+        let cursosAVerificar = cursosDB;
+        if (currentUser.cursosAsignados && currentUser.cursosAsignados.length > 0) {
+            cursosAVerificar = cursosDB.filter(c => currentUser.cursosAsignados.includes(c.id));
+        }
+        cursosAVerificar.forEach(c => {
+            if (calcularPorcentajeEstudiante(c.id, currentUser.correo) < 100) incompletos++;
+        });
+        showToast(`Te quedan ${incompletos} curso(s) por completar al 100% para rendir la evaluación.`);
+    }
+}
+
+// --- RENDICIÓN DE EVALUACIÓN ESTUDIANTE Y REQUISITO DE APROBACIÓN (12 BUENAS / 60%) ---
+function iniciarRendirEvaluacion(evalId) {
+    const evalObj = evaluacionesDB.find(e => e.id === evalId);
+    if (!evalObj) return;
+
+    let sub = studentSubmissionsDB.find(s => s.studentCorreo === currentUser.correo && s.evaluacionId === evalId);
+    let intentosRealizados = sub ? (sub.attemptsCount || 1) : 1;
+
+    const modalBody = document.getElementById('modal-body');
+    document.getElementById('modal-title').innerText = `Rindiendo: ${evalObj.titulo}`;
+
+    let html = `
+        <form onsubmit="revisarEvaluacionAntesDeEnviar(event, ${evalId})" class="space-y-4">
+            <div class="bg-blue-50 p-4 rounded-xl border border-blue-200 text-center space-y-1">
+                <p class="text-xs sm:text-sm font-black text-blue-900">¡Mucho éxito en esta evaluación! Demuestra todo lo aprendido y confía en tus capacidades.</p>
+                <p class="text-[11px] text-blue-700 font-semibold">Intento actual: #${intentosRealizados} | Requisito de Aprobación: Mínimo 12 respuestas correctas de 21 (60%).</p>
+            </div>
+    `;
+
+    evalObj.preguntas.forEach((p, pIdx) => {
+        const esVerdaderoFalso = (p.tipo === 'tf');
+        html += `
+            <div class="bg-white border rounded-xl p-4 shadow-sm space-y-2">
+                <div class="flex items-center justify-between border-b pb-1">
+                    <h5 class="font-bold text-gray-900 text-xs sm:text-sm">Pregunta #${pIdx + 1}</h5>
+                    <span class="text-[10px] font-black uppercase px-2 py-0.5 bg-slate-100 text-slate-700 rounded">${esVerdaderoFalso ? 'Verdadero o Falso' : 'Alternativas A B C D'}</span>
+                </div>
+                <p class="text-xs sm:text-sm font-semibold text-gray-800">${p.pregunta}</p>
+                <div class="space-y-1.5 pt-1">
+                    ${p.opciones.map((op, opIdx) => `
+                        <label class="flex items-center space-x-2 p-2 rounded bg-slate-50 hover:bg-slate-100 cursor-pointer border">
+                            <input type="radio" name="resp_${pIdx}" value="${opIdx}" required class="w-4 h-4 text-chile-blue">
+                            <span class="text-xs font-medium text-gray-800">${esVerdaderoFalso ? '' : ['A', 'B', 'C', 'D'][opIdx] + ') '}${op}</span>
+                        </label>
+                    `).join('')}
+                </div>
+            </div>
+        `;
+    });
+
+    html += `
+            <button type="submit" class="w-full bg-chile-blue hover:bg-chile-blue-dark text-white font-extrabold py-3 rounded-lg text-xs uppercase shadow transition">
+                Enviar Respuesta y Evaluar
+            </button>
+        </form>
+    `;
+    modalBody.innerHTML = html;
+}
+
+function revisarEvaluacionAntesDeEnviar(e, evalId) {
+    e.preventDefault();
+    const evalObj = evaluacionesDB.find(ev => ev.id === evalId);
+    if (!evalObj) return;
+
+    let subAnterior = studentSubmissionsDB.find(s => s.studentCorreo === currentUser.correo && s.evaluacionId === evalId);
+    let intentosCount = subAnterior ? (subAnterior.attemptsCount || 1) + 1 : 1;
+
+    let correctasCount = 0;
+    let incorrectasCount = 0;
+    let detalles = [];
+
+    evalObj.preguntas.forEach((p, pIdx) => {
+        const seleccion = document.querySelector(`input[name="resp_${pIdx}"]:checked`);
+        const valSeleccion = seleccion ? parseInt(seleccion.value) : 0;
+        const esCorrecta = (valSeleccion === p.correcta);
+
+        if (esCorrecta) correctasCount++;
+        else incorrectasCount++;
+
+        detalles.push({
+            pregunta: p.pregunta,
+            elegida: p.opciones[valSeleccion],
+            correctaTexto: p.opciones[p.correcta],
+            esCorrecta: esCorrecta
+        });
+    });
+
+    const totalPreguntas = evalObj.preguntas.length; // 21
+    const aprueba = (correctasCount >= 12);
+
+    studentSubmissionsDB = studentSubmissionsDB.filter(sub => !(sub.studentCorreo === currentUser.correo && sub.evaluacionId === evalId));
+    studentSubmissionsDB.push({
+        studentCorreo: currentUser.correo,
+        studentNombre: currentUser.nombreCompleto || currentUser.nombre,
+        evaluacionId: evalId,
+        evalTitulo: evalObj.titulo,
+        buenas: correctasCount,
+        malas: incorrectasCount,
+        total: totalPreguntas,
+        aprobado: aprueba,
+        attemptsCount: intentosCount,
+        detalles: detalles
+    });
+
+    persistData();
+
+    const modalBody = document.getElementById('modal-body');
+    document.getElementById('modal-title').innerText = "Resultado de Evaluación";
+
+    let htmlResultado = "";
+
+    if (aprueba) {
+        htmlResultado = `
+            <div class="p-5 rounded-xl border text-center bg-green-50 border-green-300 text-green-900 shadow-sm space-y-2">
+                <h3 class="text-base sm:text-lg font-black uppercase">¡Felicidades! Has aprobado el curso.</h3>
+                <p class="text-sm font-extrabold">Obtuviste <span class="text-green-700 font-black text-base">${correctasCount}</span> buenas y <span class="text-red-600 font-bold">${incorrectasCount}</span> malas (Cumple requisito del 60%).</p>
+                <p class="text-xs text-gray-600">Evaluación aprobada con éxito. Intento #${intentosCount}.</p>
+            </div>
+        `;
+    } else {
+        htmlResultado = `
+            <div class="p-5 rounded-xl border text-center bg-red-50 border-red-300 text-red-900 shadow-sm space-y-3">
+                <h3 class="text-base sm:text-lg font-black uppercase">Has reprobado el curso. Vuelve a intentarlo.</h3>
+                <p class="text-sm font-extrabold">Obtuviste <span class="font-black text-base">${correctasCount}</span> buenas y <span class="font-bold">${incorrectasCount}</span> malas.</p>
+                <p class="text-xs font-semibold text-gray-700">Para aprobar necesitas un mínimo de 12 buenas con 9 malas (60% de aprobación).</p>
+                <button onclick="iniciarRendirEvaluacion(${evalId})" class="mt-2 bg-chile-blue hover:bg-chile-blue-dark text-white font-bold px-6 py-2.5 rounded-lg text-xs uppercase shadow transition">
+                    Rendir De Nuevo
+                </button>
+            </div>
+        `;
+    }
+
+    modalBody.innerHTML = `
+        <div class="space-y-4 text-xs sm:text-sm">
+            ${htmlResultado}
+            <button onclick="openModal('tests')" class="w-full bg-gray-700 hover:bg-gray-800 text-white font-bold py-3 rounded-lg text-xs uppercase shadow transition">
+                Volver a Evaluación
+            </button>
+        </div>
+    `;
+    showToast(aprueba ? "¡Felicidades! Has aprobado el curso." : "Has reprobado el curso. Vuelve a intentarlo.");
+}
+
+// --- APERTURA DE MODALES PARA ESTUDIANTE (E INFORMATIVO DOCENTE SI APLICA) ---
+function openModal(key) {
+    const modalIcon = document.getElementById('modal-icon');
+    const isDocente = (currentRole === 'docente');
+
+    if (key === 'courses') {
+        const numCursos = (currentUser && currentUser.cursosAsignados) ? currentUser.cursosAsignados.length : 0;
+        document.getElementById('modal-title').innerText = isDocente ? "CURSOS Y CREDENCIALES" : (numCursos <= 1 ? "MI CURSO Y PROGRESO" : "MIS CURSOS Y PROGRESO");
+        modalIcon.className = 'fa-solid fa-graduation-cap text-amber-400 text-2xl';
+
+        let html = `<div class="space-y-5">`;
+
+        if (isDocente) {
+            html += `<p class="text-xs text-gray-600 font-semibold">Toda la administración de cursos y credenciales se encuentra en la vista principal de Lista de Docente.</p>`;
+        } else {
+            // FILTRAR CURSOS VISIBLES PARA EL ESTUDIANTE SEGÚN LOS ASIGNADOS POR EL DOCENTE Exclusivamente
+            let cursosVisiblesEstudiante = [];
+            if (currentUser && currentUser.cursosAsignados && currentUser.cursosAsignados.length > 0) {
+                cursosVisiblesEstudiante = cursosDB.filter(c => currentUser.cursosAsignados.includes(c.id));
+            }
+
+            html += `
+                <div class="space-y-4">
+                    <div class="bg-blue-50 border-l-4 border-chile-blue p-3 rounded-r">
+                        <h4 class="font-bold text-blue-900 text-xs sm:text-sm">Tus Cursos y Progreso</h4>
+                        <p class="text-xs text-blue-800">El 100% del curso se completa exclusivamente viendo todos los <strong>videos (.mp4)</strong>.</p>
+                    </div>
+                    ${cursosVisiblesEstudiante.length === 0 ? '<p class="text-xs text-gray-500">No tienes cursos asignados actualmente.</p>' : `
+                        <div class="grid grid-cols-1 gap-3">
+                            ${cursosVisiblesEstudiante.map(c => {
+                                const porcentaje = calcularPorcentajeEstudiante(c.id, currentUser.correo);
+
+                                return `
+                                    <div class="p-4 bg-white border-2 border-blue-100 rounded-xl shadow-sm space-y-3">
+                                        <div class="flex justify-between items-start">
+                                            <div>
+                                                <h5 class="font-bold text-gray-900 text-sm">${c.nombre}</h5>
+                                                <p class="text-xs text-gray-600 mt-0.5">${c.descripcion}</p>
+                                            </div>
+                                            <span class="px-2.5 py-1 rounded-full text-xs font-extrabold ${porcentaje === 100 ? 'bg-green-100 text-green-800' : 'bg-amber-100 text-amber-800'}">
+                                                Progreso Videos: ${porcentaje}%
+                                            </span>
+                                        </div>
+                                        <div class="w-full bg-gray-200 rounded-full h-2.5 overflow-hidden">
+                                            <div class="bg-chile-blue h-2.5 rounded-full" style="width: ${porcentaje}%"></div>
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    `}
+                </div>
+            `;
+        }
+
+        html += `</div>`;
+        document.getElementById('modal-body').innerHTML = html;
+    } else if (key === 'resources') {
+        const numCursos = (currentUser && currentUser.cursosAsignados) ? currentUser.cursosAsignados.length : 0;
+        document.getElementById('modal-title').innerText = isDocente ? "GESTIÓN DE VIDEOS Y MATERIAL COMPLEMENTARIO" : (numCursos <= 1 ? "RECURSOS Y VIDEOS" : "RECURSOS Y VIDEOS");
+        modalIcon.className = 'fa-solid fa-folder-open text-amber-400 text-2xl';
+
+        let html = `<div class="space-y-5">`;
+
+        // Filtrar videos y materiales visibles para estudiantes según cursos asignados EXCLUSIVAMENTE
+        let materialesVisibles = materialesDB;
+        let complementariosVisibles = complementariosDB;
+
+        if (!isDocente && currentUser && currentUser.cursosAsignados) {
+            materialesVisibles = materialesDB.filter(m => currentUser.cursosAsignados.includes(m.cursoId));
+            complementariosVisibles = complementariosDB.filter(c => currentUser.cursosAsignados.includes(c.cursoId));
+        }
+
+        const tituloSeccionVideo = "Clases Grabadas vía Zoom";
+
+        html += `
+            <div class="space-y-4">
+                <div class="bg-slate-50 p-4 rounded-xl border">
+                    <h4 class="font-bold text-xs text-gray-900 mb-3"><i class="fa-solid fa-play-circle text-purple-700 mr-1"></i> ${tituloSeccionVideo} (${materialesVisibles.length})</h4>
+                    ${materialesVisibles.length === 0 ? '<p class="text-xs text-gray-500 italic">No hay videos cargados para tus cursos asignados.</p>' : `
+                        <div class="space-y-2">
+                            ${materialesVisibles.map(m => {
+                                const curso = cursosDB.find(c => c.id === m.cursoId);
+                                return `
+                                    <div class="flex items-center justify-between p-3 bg-white border rounded-lg shadow-sm">
+                                        <div class="truncate pr-2">
+                                            <div class="flex items-center space-x-2">
+                                                <i class="fa-solid fa-file-video text-purple-600"></i>
+                                                <h5 class="font-bold text-gray-900 text-xs sm:text-sm truncate">${m.titulo}</h5>
+                                            </div>
+                                            <p class="text-[11px] text-gray-500">Curso: ${curso ? curso.nombre : 'General'} | Peso Real: ${m.tamano}</p>
+                                        </div>
+                                        <div class="flex items-center space-x-1">
+                                            <button onclick="reproducirVideoModal('${m.titulo.replace(/'/g, "")}', '${m.url}', '${m.tamano}', ${m.id})" class="px-3 py-1.5 bg-purple-600 text-white rounded font-bold text-xs">
+                                                Ver Video
+                                            </button>
+                                            ${isDocente ? `<button onclick="eliminarMaterial(${m.id})" class="p-1.5 text-red-600 border rounded" title="Eliminar"><i class="fa-solid fa-trash"></i></button>` : ''}
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    `}
+                </div>
+
+                <div class="bg-blue-50/50 p-4 rounded-xl border">
+                    <h4 class="font-bold text-xs text-blue-900 mb-3"><i class="fa-solid fa-folder-open text-blue-600 mr-1"></i> Material Complementario (${complementariosVisibles.length})</h4>
+                    ${complementariosVisibles.length === 0 ? '<p class="text-xs text-gray-500 italic">No hay material complementario cargado para tus cursos asignados.</p>' : `
+                        <div class="space-y-2">
+                            ${complementariosVisibles.map(comp => {
+                                const curso = cursosDB.find(c => c.id === comp.cursoId);
+                                const isUrl = (comp.tipo === 'URL');
+                                return `
+                                    <div class="flex items-center justify-between p-3 bg-white border rounded-lg shadow-sm">
+                                        <div class="truncate pr-2">
+                                            <div class="flex items-center space-x-2">
+                                                <i class="${isUrl ? 'fa-solid fa-link text-blue-500' : 'fa-solid fa-file-arrow-down text-blue-700'}"></i>
+                                                <h5 class="font-bold text-gray-900 text-xs sm:text-sm truncate">${comp.titulo}</h5>
+                                            </div>
+                                            <p class="text-[11px] text-gray-500">Curso: ${curso ? curso.nombre : 'General'} | ${comp.tamano}</p>
+                                        </div>
+                                        <div class="flex items-center space-x-1">
+                                            <button onclick="abrirComplementario(${comp.id})" class="px-3 py-1.5 bg-blue-600 text-white rounded font-bold text-xs">
+                                                ${isUrl ? 'Ver Link URL' : 'Descargar Archivo'}
+                                            </button>
+                                            ${isDocente ? `<button onclick="eliminarComplementario(${comp.id})" class="p-1.5 text-red-600 border rounded" title="Eliminar"><i class="fa-solid fa-trash"></i></button>` : ''}
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    `}
+                </div>
+            </div>
+        `;
+
+        html += `</div>`;
+        document.getElementById('modal-body').innerHTML = html;
+    } else if (key === 'tests') {
+        const numCursos = (currentUser && currentUser.cursosAsignados) ? currentUser.cursosAsignados.length : 0;
+        document.getElementById('modal-title').innerText = isDocente ? "SISTEMA DE CREACIÓN DE EVALUACIONES" : (numCursos <= 1 ? "EVALUACIÓN DE CURSO" : "EVALUACIONES DE CURSOS");
+        modalIcon.className = 'fa-solid fa-file-signature text-amber-400 text-2xl';
+
+        let html = `<div class="space-y-5">`;
+
+        if (!isDocente) {
+            let evaluacionesVisibles = evaluacionesDB;
+            if (currentUser && currentUser.cursosAsignados) {
+                evaluacionesVisibles = evaluacionesDB.filter(e => currentUser.cursosAsignados.includes(e.cursoId));
+            }
+
+            const todosCursosCompletos = estudianteCompletoTodosLosCursos(currentUser.correo);
+
+            html += `
+                <div class="space-y-4">
+                    ${evaluacionesVisibles.length === 0 ? '<p class="text-xs text-gray-500 italic p-4 bg-white rounded border">No hay evaluaciones disponibles para tus cursos asignados.</p>' : `
+                        <div class="grid grid-cols-1 gap-3">
+                            ${evaluacionesVisibles.map(ev => {
+                                const habilitadaPorDocente = ev.habilitadaDocente;
+                                const puedeRendir = todosCursosCompletos && habilitadaPorDocente;
+                                const subEnviado = studentSubmissionsDB.find(sub => sub.studentCorreo === currentUser.correo && sub.evaluacionId === ev.id);
+                                const intentosRealizados = subEnviado ? (subEnviado.attemptsCount || 1) : 0;
+                                const curso = cursosDB.find(c => c.id === ev.cursoId);
+
+                                return `
+                                    <div class="p-4 bg-white border-2 border-blue-100 rounded-xl shadow-sm space-y-3">
+                                        <div class="flex justify-between items-start">
+                                            <div>
+                                                <h5 class="font-bold text-gray-900 text-sm">${ev.titulo}</h5>
+                                                <p class="text-xs text-gray-600 mt-1">Curso: ${curso ? curso.nombre : 'General'} (21 preguntas).</p>
+                                                <p class="text-xs text-gray-500 mt-0.5">Intentos realizados: <strong class="text-chile-blue">${intentosRealizados}</strong>.</p>
+                                            </div>
+                                            <span class="px-2.5 py-1 rounded-full text-xs font-extrabold ${puedeRendir ? 'bg-green-100 text-green-800' : 'bg-amber-100 text-amber-800'}">
+                                                ${puedeRendir ? 'Habilitada' : 'Bloqueada'}
+                                            </span>
+                                        </div>
+
+                                        <div class="space-y-1.5 pt-2 border-t text-xs">
+                                            <div class="flex items-center space-x-2 ${todosCursosCompletos ? 'text-green-700' : 'text-amber-700'} font-semibold">
+                                                <i class="fa-solid ${todosCursosCompletos ? 'fa-circle-check' : 'fa-circle-xmark'}"></i>
+                                                <span>Requisito: Completar el 100% de los videos de cada curso estudiado (${todosCursosCompletos ? 'Cumplido' : 'Pendiente'}).</span>
+                                            </div>
+                                            <div class="flex items-center space-x-2 ${habilitadaPorDocente ? 'text-green-700' : 'text-amber-700'} font-semibold">
+                                                <i class="fa-solid ${habilitadaPorDocente ? 'fa-circle-check' : 'fa-circle-xmark'}"></i>
+                                                <span>Estado Docente: ${habilitadaPorDocente ? 'Habilitada por Docente' : 'Inhabilitada por Docente'}.</span>
+                                            </div>
+                                        </div>
+
+                                        <div class="pt-3 flex justify-between items-center border-t">
+                                            ${subEnviado ? `<span class="text-xs font-bold ${subEnviado.aprobado ? 'text-green-700' : 'text-red-600'}">${subEnviado.aprobado ? '¡Felicidades! Has aprobado el curso.' : 'Has reprobado el curso. Vuelve a intentarlo.'}</span>` : '<span></span>'}
+                                            ${puedeRendir ? `
+                                                <button onclick="iniciarRendirEvaluacion(${ev.id})" class="bg-chile-blue hover:bg-chile-blue-dark text-white font-bold px-5 py-2.5 rounded-lg text-xs uppercase shadow transition">
+                                                    Rendir Evaluación
+                                                </button>
+                                            ` : `
+                                                <span class="text-xs text-amber-800 font-bold bg-amber-50 px-3 py-1.5 rounded border border-amber-200">
+                                                    Evaluación aún no disponible.
+                                                </span>
+                                            `}
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    `}
+                </div>
+            `;
+        }
+
+        html += `</div>`;
+        document.getElementById('modal-body').innerHTML = html;
+    }
+
+    document.getElementById('modal-overlay').classList.remove('hidden');
+}
+
+function preventBackdropClose(event) {
+    event.stopPropagation();
+}
+
+function closeModal() {
+    document.getElementById('modal-overlay').classList.add('hidden');
+}
+
+function showToast(message) {
+    const container = document.getElementById('toast-container');
+    const toast = document.createElement('div');
+    toast.className = "bg-gray-900 text-white px-4 py-3 rounded-lg shadow-xl mb-2 text-xs sm:text-sm flex items-center space-x-2 transition transform translate-y-2 opacity-0";
+    toast.innerHTML = `<i class="fa-solid fa-circle-info text-blue-400 flex-shrink-0"></i><span>${message}</span>`;
+    
+    container.appendChild(toast);
+    setTimeout(() => toast.classList.remove('translate-y-2', 'opacity-0'), 10);
+    setTimeout(() => {
+        toast.classList.add('opacity-0');
+        setTimeout(() => toast.remove(), 300);
+    }, 3000);
+}
+
+function handleLogout() {
+    currentUser = null;
+    currentRole = null;
+    try {
+        localStorage.removeItem('ci2050_last_role');
+        localStorage.removeItem('ci2050_last_user');
+    } catch(e) {}
+    closeModal();
+    document.getElementById('main-app').classList.add('hidden');
+    document.getElementById('auth-screen').classList.add('hidden');
+    document.getElementById('role-selection-screen').classList.remove('hidden');
+    showToast("Sesión cerrada.");
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+    initStorage();
+});
